@@ -1,3 +1,8 @@
+/*
+ * Campo Minado- Estruturas de Dados
+ * Integração: Pilha (Undo), Fila (Flood Fill), Lista Dupla (Flags)
+ */
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -6,634 +11,662 @@
 #include <string.h>
 #include <time.h>
 
-#define IN_BUF_SIZE 128
+/* --- CONFIGURAÇÕES E MACROS --- */
 
-/* --- Macros de Acesso e Manipulação de Bits --- */
-#define CELLS_AT(board, x, y) ((board)->cells[(y) * (board)->width + (x)])
+/* Tamanho máximo do buffer de entrada */
+#define TAM_BUFFER_ENTRADA 128
 
-#define MINE_OFFSET   0x05
-#define FLAG_OFFSET   0x06
-#define REVEAL_OFFSET 0x07
-#define MINE_MASK     0x0f
+/* Acesso à matriz linearizada */
+#define CELULA_EM(tabuleiro, x, y) ((tabuleiro)->celulas[(y) * (tabuleiro)->largura + (x)])
 
-#define IS_MINE(cell)     (((cell) >> MINE_OFFSET)   & 0x1) 
-#define IS_FLAGGED(cell)  (((cell) >> FLAG_OFFSET)   & 0x1)
-#define IS_REVEALED(cell) (((cell) >> REVEAL_OFFSET) & 0x1)
-#define MINE_NUM(cell)    ((cell) & MINE_MASK)
+#define DESLOC_MINA      0x05
+#define DESLOC_BANDEIRA  0x06
+#define DESLOC_REVELADA  0x07
+#define MASCARA_MINAS    0x0f
 
-#define SET_MINE(cell, bit)     ((cell) = ((cell) & ~(0x1 << MINE_OFFSET))   | ((bit) << 0x5))
-#define SET_FLAGGED(cell, bit)  ((cell) = ((cell) & ~(0x1 << FLAG_OFFSET))   | ((bit) << 0x6))
-#define SET_REVEALED(cell, bit) ((cell) = ((cell) & ~(0x1 << REVEAL_OFFSET)) | ((bit) << 0x7))
+/* Leitura dos bits */
+#define EH_MINA(cel)          (((cel) >> DESLOC_MINA)      & 0x1)
+#define TEM_BANDEIRA(cel)     (((cel) >> DESLOC_BANDEIRA)  & 0x1)
+#define ESTA_REVELADA(cel)    (((cel) >> DESLOC_REVELADA)  & 0x1)
+#define NUM_MINAS(cel)        ((cel) & MASCARA_MINAS)
 
-/* --- Direções para verificar vizinhos (8 direções) --- */
-static const int dirs[][2] = {
+/* Escrita dos bits */
+#define DEFINIR_MINA(cel, bit)        ((cel) = ((cel) & ~(0x1 << DESLOC_MINA))      | ((bit) << DESLOC_MINA))
+#define DEFINIR_BANDEIRA(cel, bit)    ((cel) = ((cel) & ~(0x1 << DESLOC_BANDEIRA))  | ((bit) << DESLOC_BANDEIRA))
+#define DEFINIR_REVELADA(cel, bit)    ((cel) = ((cel) & ~(0x1 << DESLOC_REVELADA))  | ((bit) << DESLOC_REVELADA))
+
+
+/* --- DIREÇÕES DOS 8 VIZINHOS --- */
+
+static const int direcoes[][2] = {
     {-1, -1}, {-1, 1}, {1, -1}, {1, 1},
     {0, -1}, {0, 1}, {-1, 0}, {1, 0},
 };
 
 // Tipo base da célula
-typedef uint8_t Cell;
+typedef uint8_t Celula;
 
 /* --- ESTRUTURAS DE DADOS --- */
 
-/**
- * @brief Nó para a Lista Duplamente Encadeada (Gerenciamento de Bandeiras).
- */
-typedef struct DListNode {
+//LISTA DUPLA: gerencia bandeira - guarda bandeira colocada, mostra na ordem que foi colocada e tambem remove... ela verifica se a bandeira que vvc quer colocar ja existe ou não
+typedef struct NoListaDupla {
     size_t x, y;
-    struct DListNode *prev;
-    struct DListNode *next;
-} DListNode;
+    struct NoListaDupla *anterior;
+    struct NoListaDupla *proximo;
+} NoListaDupla;
 
-/**
- * @brief Nó para a Fila (Algoritmo de Flood Fill).
- */
-typedef struct QueueNode {
+//FILA: revela grandes areas de mina
+typedef struct NoFila {
     size_t x, y;
-    struct QueueNode *next;
-} QueueNode;
+    struct NoFila *proximo;
+} NoFila;
 
-/**
- * @brief Nó para a Pilha (Sistema de Undo/Desfazer).
- * Armazena a coordenada e o estado anterior da célula.
- */
-typedef struct StackNode {
+//PILHA: fazer o undo, pois a ultima informação que entrou, é a primeira que sai
+typedef struct NoPilha {
     size_t x, y;
-    Cell old_value;       // Valor da célula antes da modificação
-    bool is_batch_start;  // Marca o início de um grupo de mudanças (ex: 1 clique revelou 10 células)
-    struct StackNode *next;
-} StackNode;
+    Celula valor_antigo;
+    bool inicio_lote;
+    struct NoPilha *proximo;
+} NoPilha;
 
-/* --- ESTRUTURA DO JOGO --- */
+/* --- ESTADO DO JOGO --- */
 
 typedef struct {
-    size_t width;
-    size_t height;
-    size_t mine_num;
-    Cell *cells;
+    size_t largura;
+    size_t altura;
+    size_t qtd_minas;
+    Celula *celulas;
     
-    // Ponteiros para as Estruturas de Dados
-    DListNode *flags_head; // Cabeça da Lista Dupla de flags
-    DListNode *flags_tail; // Cauda da Lista Dupla (para inserção rápida se necessário)
-    
-    StackNode *undo_stack; // Topo da Pilha de Undo
-} Board;
+    // Cabeças das estruturas
+    NoListaDupla *inicio_bandeiras; 
+    NoPilha *pilha_desfazer; 
+} Tabuleiro;
 
-/* Variável Global para contagem de células reveladas */
-size_t revealed_cells = 0;
+// Global para controle rápido de vitória
+size_t celulas_reveladas = 0;
 
-/* --- PROTÓTIPOS AUXILIARES DAS ESTRUTURAS --- */
 
-/**
- * @brief Adiciona uma coordenada à lista dupla de bandeiras.
- * @param board Ponteiro para o tabuleiro.
- * @param x Coordenada X.
- * @param y Coordenada Y.
- */
-void dlist_add(Board *board, size_t x, size_t y) {
-    DListNode *node = malloc(sizeof(DListNode));
-    node->x = x;
-    node->y = y;
-    node->next = board->flags_head;
-    node->prev = NULL;
+/* --- IMPLEMENTAÇÃO DAS ESTRUTURAS DE DADOS --- */
 
-    if (board->flags_head != NULL) {
-        board->flags_head->prev = node;
+// Adiciona coordenada à Lista Dupla de bandeiras.
+void lista_dupla_adicionar(Tabuleiro *t, size_t x, size_t y) {
+    NoListaDupla *no = malloc(sizeof(NoListaDupla));
+    no->x = x;
+    no->y = y;
+    no->proximo = t->inicio_bandeiras;
+    no->anterior = NULL;
+
+    if (t->inicio_bandeiras != NULL) {
+        t->inicio_bandeiras->anterior = no;
     }
-    board->flags_head = node;
+    t->inicio_bandeiras = no;
 }
 
-/**
- * @brief Remove uma coordenada da lista dupla de bandeiras.
- * @param board Ponteiro para o tabuleiro.
- * @param x Coordenada X.
- * @param y Coordenada Y.
- */
-void dlist_remove(Board *board, size_t x, size_t y) {
-    DListNode *current = board->flags_head;
-    while (current != NULL) {
-        if (current->x == x && current->y == y) {
-            if (current->prev) current->prev->next = current->next;
-            if (current->next) current->next->prev = current->prev;
-            if (current == board->flags_head) board->flags_head = current->next;
-            free(current);
+// Remove coordenada da Lista Dupla de bandeiras.
+void lista_dupla_remover(Tabuleiro *t, size_t x, size_t y) {
+    NoListaDupla *atual = t->inicio_bandeiras;
+    while (atual != NULL) {
+        if (atual->x == x && atual->y == y) {
+            if (atual->anterior) atual->anterior->proximo = atual->proximo;
+            if (atual->proximo)  atual->proximo->anterior = atual->anterior;
+            if (atual == t->inicio_bandeiras)
+                t->inicio_bandeiras = atual->proximo;
+            free(atual);
             return;
         }
-        current = current->next;
+        atual = atual->proximo;
     }
 }
 
-/**
- * @brief Empilha uma alteração de estado para o sistema de Undo.
- * @param board Ponteiro para o tabuleiro.
- * @param x Coordenada X.
- * @param y Coordenada Y.
- * @param old_val Valor antigo da célula.
- * @param batch_start Booleano indicando se esta é a primeira mudança de uma ação do usuário.
- */
-void stack_push(Board *board, size_t x, size_t y, Cell old_val, bool batch_start) {
-    StackNode *node = malloc(sizeof(StackNode));
-    node->x = x;
-    node->y = y;
-    node->old_value = old_val;
-    node->is_batch_start = batch_start;
-    node->next = board->undo_stack;
-    board->undo_stack = node;
-}
+// Desfaz a última jogada (reverte um lote inteiro).
+bool pilha_desfazer(Tabuleiro *t) {
+    if (t->pilha_desfazer == NULL) return false;
 
-/**
- * @brief Desempilha e reverte alterações até encontrar o início do "lote" (batch).
- * @param board Ponteiro para o tabuleiro.
- * @return true se algo foi desfeito, false se a pilha estava vazia.
- */
-bool stack_undo(Board *board) {
-    if (board->undo_stack == NULL) return false;
+    NoPilha *n = t->pilha_desfazer;
 
-    bool first = true;
-    while (board->undo_stack != NULL) {
-        StackNode *top = board->undo_stack;
-        
-        // Se for o início de um novo lote e não é o primeiro item que pegamos, paramos.
-        if (top->is_batch_start && !first) break;
+    // Se topo é marcador e nada depois dele → nada a desfazer
+    if (n->inicio_lote && n->proximo == NULL)
+        return false;
 
-        // Reverte o estado
-        Cell current = CELLS_AT(board, top->x, top->y);
-        
-        // Atualiza contadores globais/listas auxiliares ao reverter
-        if (IS_REVEALED(current) && !IS_REVEALED(top->old_value)) {
-            revealed_cells--;
-        }
-        if (IS_FLAGGED(current) && !IS_FLAGGED(top->old_value)) {
-            dlist_remove(board, top->x, top->y);
-        } else if (!IS_FLAGGED(current) && IS_FLAGGED(top->old_value)) {
-            dlist_add(board, top->x, top->y);
-        }
-
-        CELLS_AT(board, top->x, top->y) = top->old_value;
-
-        // Remove da pilha
-        board->undo_stack = top->next;
-        free(top);
-        first = false;
+    // Remove marcador do topo (se for o caso)
+    if (n->inicio_lote) {
+        t->pilha_desfazer = n->proximo;
+        free(n);
+        n = t->pilha_desfazer;
     }
+
+    // Agora desfaz até encontrar um marcador
+    while (n && !n->inicio_lote) {
+
+        // restaurar célula
+        CELULA_EM(t, n->x, n->y) = n->valor_antigo;
+
+        // estatísticas
+        if (!ESTA_REVELADA(n->valor_antigo))
+            celulas_reveladas--;
+
+        // próximo item
+        NoPilha *tmp = n;
+        n = n->proximo;
+        free(tmp);
+    }
+
+    // remover o marcador
+    if (n && n->inicio_lote) {
+        NoPilha *tmp = n;
+        t->pilha_desfazer = n->proximo;
+        free(tmp);
+    } else {
+        t->pilha_desfazer = NULL;
+    }
+
     return true;
 }
 
-/* --- FUNÇÕES DO JOGO --- */
+//Guarda jogada antiga na Pilha do Undo
+void empilhar_undo(Tabuleiro *t, size_t x, size_t y, Celula valor_antigo, bool inicio_lote)
+{
+    NoPilha *novo = malloc(sizeof(NoPilha));
+    if (!novo) return;
 
-/**
- * @brief Inicializa o jogo, aloca memória para o tabuleiro e distribui as minas.
- * @param board Ponteiro para a estrutura do tabuleiro.
- */
-void init_game(Board *board) {
-    revealed_cells = 0;
-    board->flags_head = NULL;
-    board->undo_stack = NULL;
+    novo->x = x;
+    novo->y = y;
+    novo->valor_antigo = valor_antigo;
+    novo->inicio_lote = inicio_lote;
 
-    board->cells = realloc(board->cells, board->width * board->height * sizeof(*board->cells));
-    if (board->cells == NULL) {
-        perror("ERROR: malloc");
+    novo->proximo = t->pilha_desfazer;  // empilha
+    t->pilha_desfazer = novo;
+}
+
+//Funcionalidade da bandeira
+void alternar_bandeira(Tabuleiro *t, size_t x, size_t y) {
+    Celula *cel = &CELULA_EM(t, x, y);
+
+    // Não pode alternar bandeira se a célula já está revelada
+    if (ESTA_REVELADA(*cel)) return;
+
+    // Empilha estado antigo para undo
+    empilhar_undo(t, x, y, *cel, true);
+
+    if (TEM_BANDEIRA(*cel)) {
+        // Remove bandeira da lista
+        lista_dupla_remover(t, x, y);
+        DEFINIR_BANDEIRA(*cel, false);
+    } else {
+        // Coloca bandeira na lista
+        lista_dupla_adicionar(t, x, y);
+        DEFINIR_BANDEIRA(*cel, true);
+    }
+}
+
+//Inicia um nó que inicia um lote das celulas reveladas
+void empilhar_inicio_lote(Tabuleiro *t) {
+    NoPilha *n = malloc(sizeof(NoPilha));
+    n->inicio_lote = true;
+    n->proximo = t->pilha_desfazer;
+    t->pilha_desfazer = n;
+}
+
+/* --- LÓGICA DO JOGO --- */
+
+// Lê input do usuário removendo newline.
+void ler_entrada(char *buf, int tamanho) {
+    if (fgets(buf, tamanho, stdin) != NULL) {
+        buf[strcspn(buf, "\n")] = 0;
+    } else {
+        buf[0] = 0;
+    }
+}
+
+// Inicializa o tabuleiro e distribui minas.
+void iniciar_jogo(Tabuleiro *t) {
+    celulas_reveladas = 0;
+    t->inicio_bandeiras = NULL;
+    t->pilha_desfazer = NULL;
+
+    t->celulas = realloc(t->celulas, t->largura * t->altura * sizeof(*t->celulas));
+    if (!t->celulas) {
+        perror("ERRO: malloc");
         exit(EXIT_FAILURE);
     }
-    memset(board->cells, 0, board->width * board->height * sizeof(Cell));
+    memset(t->celulas, 0, t->largura * t->altura * sizeof(Celula));
 
-    for (size_t i = 0; i < board->mine_num; i++) {
+    // Distribuir minas
+    for (size_t i = 0; i < t->qtd_minas; i++) {
         size_t x, y;
         do {
-            x = rand() % board->width;
-            y = rand() % board->height;
-        } while (IS_MINE(CELLS_AT(board, x, y)));
-        
-        SET_MINE(CELLS_AT(board, x, y), true);
-        
-        // Atualiza números ao redor da mina
+            x = rand() % t->largura;
+            y = rand() % t->altura;
+        } while (EH_MINA(CELULA_EM(t, x, y)));
+
+        DEFINIR_MINA(CELULA_EM(t, x, y), true);
+
         for (size_t j = 0; j < 8; j++) {
-            size_t nx = x + dirs[j][0];
-            size_t ny = y + dirs[j][1];
-            if (nx >= board->width || ny >= board->height) continue;
-            if (IS_MINE(CELLS_AT(board, nx, ny))) continue;
-            CELLS_AT(board, nx, ny)++;
+            size_t nx = x + direcoes[j][0];
+            size_t ny = y + direcoes[j][1];
+            if (nx >= t->largura || ny >= t->altura) continue;
+            if (EH_MINA(CELULA_EM(t, nx, ny))) continue;
+            CELULA_EM(t, nx, ny)++;
         }
     }
 }
 
-/**
- * @brief Imprime uma única célula com formatação de cores ANSI.
- * @param cell O valor da célula a ser impressa.
- */
-void print_cell(Cell cell) {
+// Imprime célula colorida.
+void imprimir_celula(Celula c) {
     printf("\x1b[1m");
-    if (IS_REVEALED(cell)) {
-        printf("\x1b[47m"); // Fundo branco/cinza claro
-        if (IS_MINE(cell)) {
-            printf("\x1b[31m#"); // Mina vermelha
-        } else if (MINE_NUM(cell) != 0) {
-            uint8_t num = MINE_NUM(cell);
-            // Cores baseadas no Minesweeper clássico
+
+    if (ESTA_REVELADA(c)) {
+        printf("\x1b[47m"); // Fundo claro
+
+        if (EH_MINA(c)) {
+            printf("\x1b[31m#");
+        } else if (NUM_MINAS(c) != 0) {
+            uint8_t num = NUM_MINAS(c);
+
             switch (num) {
-                case 1: printf("\x1b[94m"); break; // Azul claro
-                case 2: printf("\x1b[32m"); break; // Verde
-                case 3: printf("\x1b[91m"); break; // Vermelho claro
-                case 4: printf("\x1b[34m"); break; // Azul escuro
-                case 5: printf("\x1b[31m"); break; // Vermelho
-                case 6: printf("\x1b[36m"); break; // Ciano
-                case 7: printf("\x1b[30m"); break; // Preto
-                case 8: printf("\x1b[90m"); break; // Cinza
-                default: assert(false && "Unreachable");
+                case 1: printf("\x1b[94m"); break; 
+                case 2: printf("\x1b[32m"); break;
+                case 3: printf("\x1b[91m"); break;
+                case 4: printf("\x1b[34m"); break;
+                case 5: printf("\x1b[31m"); break;
+                case 6: printf("\x1b[36m"); break;
+                case 7: printf("\x1b[30m"); break;
+                case 8: printf("\x1b[90m"); break;
             }
+
             printf("%u", num);
         } else {
             printf(" ");
         }
+
     } else {
-        printf("\x1b[100m"); // Fundo cinza escuro (não revelado)
-        if (IS_FLAGGED(cell)) {
-            printf("\x1b[91m!"); // Bandeira vermelha
+        printf("\x1b[100m");
+        if (TEM_BANDEIRA(c)) {
+            printf("\x1b[91m!");
         } else {
-            printf("\x1b[37m."); // Ponto branco
+            printf("\x1b[37m.");
         }
     }
-    printf(" \x1b[0m"); // Reset
+
+    printf(" \x1b[0m");
 }
 
-/**
- * @brief Renderiza o tabuleiro completo no terminal.
- * @param board Ponteiro para o tabuleiro.
- */
-void print_board(Board *board) {
+//Imprime o tabuleiro completo.
+void imprimir_tabuleiro(Tabuleiro *t) {
     printf("   X ");
-    for (size_t i = 0; i < board->width; i++) {
-        size_t units = i % 10;
-        printf("%zu%c", units, " |"[units == 9]);
+    for (size_t i = 0; i < t->largura; i++) {
+        size_t unidade = i % 10;
+        printf("%zu%c", unidade, " |"[unidade == 9]);
     }
     printf("\n Y\x1b[1;40;37m +");
-    for (size_t i = 0; i < board->width*2 + 1; i++) printf("-");
+    for (size_t i = 0; i < t->largura * 2 + 1; i++) printf("-");
     printf("+ \x1b[0m\n");
 
-    for (size_t y = 0; y < board->height; y++) {
-        printf("%2zu\x1b[1;40;37m |\x1b[%dm ", y, IS_REVEALED(CELLS_AT(board, 0, y)) ? 47 : 100);
-        for (size_t x = 0; x < board->width; x++) {
-            print_cell(CELLS_AT(board, x, y));
+    for (size_t y = 0; y < t->altura; y++) {
+        printf("%2zu\x1b[1;40;37m |\x1b[%dm ", 
+               y, 
+               ESTA_REVELADA(CELULA_EM(t, 0, y)) ? 47 : 100
+        );
+
+        for (size_t x = 0; x < t->largura; x++) {
+            imprimir_celula(CELULA_EM(t, x, y));
         }
+
         printf("\x1b[1;40;37m| \x1b[0m\n");
     }
 
     printf("  \x1b[1;40;37m +");
-    for (size_t i = 0; i < board->width*2 + 1; i++) printf("-");
+    for (size_t i = 0; i < t->largura * 2 + 1; i++) printf("-");
     printf("+ \n\x1b[0m");
 }
 
-/**
- * @brief Lê uma linha de comando do usuário.
- * @param buf Buffer onde a string será armazenada.
- */
-void read_command(char *buf) {
-    printf("> ");
-    if (fgets(buf, IN_BUF_SIZE, stdin) == NULL) {
-        perror("ERROR: fgets");
-        exit(EXIT_FAILURE);
+//Limpa a tela e redesenha interface com informações
+void atualizar_tela(Tabuleiro *t) {
+    printf("\x1b[H\x1b[2J"); 
+    imprimir_tabuleiro(t);
+
+    // Estatísticas das estruturas de dados
+    size_t profundidade_pilha = 0;
+    NoPilha *p = t->pilha_desfazer;
+    while (p) { 
+        profundidade_pilha++; 
+        p = p->proximo; 
     }
-    buf[strlen(buf) - 1] = '\0';
+    
+    size_t total_bandeiras = 0;
+    NoListaDupla *b = t->inicio_bandeiras;
+    while (b) { 
+        total_bandeiras++; 
+        b = b->proximo; 
+    }
+    
+    printf("--- Informações ---\n");
+    printf("Jogadas Feitas: %zu | Bandeiras Ativas: %zu\n",
+           profundidade_pilha,
+           total_bandeiras
+    );
 }
 
-/**
- * @brief Revela uma célula e seus vizinhos vazios usando uma FILA (Queue).
- * Implementa o algoritmo BFS (Breadth-First Search) para evitar recursão.
- * * @param board Ponteiro para o tabuleiro.
- * @param start_x Coordenada X inicial.
- * @param start_y Coordenada Y inicial.
- */
-void reveal_cell(Board *board, size_t start_x, size_t start_y) {
-    // Se já revelado ou marcado, ignora
-    if (IS_REVEALED(CELLS_AT(board, start_x, start_y)) || IS_FLAGGED(CELLS_AT(board, start_x, start_y))) return;
+//Revela uma célula usando Fila
+void revelar_celula(Tabuleiro *t, size_t x_inicio, size_t y_inicio) {
+    if (ESTA_REVELADA(CELULA_EM(t, x_inicio, y_inicio)) ||
+        TEM_BANDEIRA(CELULA_EM(t, x_inicio, y_inicio)))
+        return;
+    empilhar_inicio_lote(t);
 
-    // Inicializa a Fila
-    QueueNode *head = NULL;
-    QueueNode *tail = NULL;
-
-    // Função auxiliar local (via ponteiro) ou bloco de código para Enfileirar
-    #define ENQUEUE(qx, qy) do { \
-        QueueNode *new_node = malloc(sizeof(QueueNode)); \
-        new_node->x = (qx); new_node->y = (qy); \
-        new_node->next = NULL; \
-        if (tail) tail->next = new_node; \
-        else head = new_node; \
-        tail = new_node; \
+    /* Macro local para enfileirar nós */
+    NoFila *inicio = NULL, *fim = NULL;
+    #define ENFILEIRAR(px, py) do { \
+        NoFila *novo = malloc(sizeof(NoFila)); \
+        novo->x = (px); \
+        novo->y = (py); \
+        novo->proximo = NULL; \
+        if (fim) fim->proximo = novo; else inicio = novo; \
+        fim = novo; \
     } while(0)
 
-    ENQUEUE(start_x, start_y);
+    ENFILEIRAR(x_inicio, y_inicio);
     
-    // Salva estado para Undo (apenas o início do "lote")
-    stack_push(board, start_x, start_y, CELLS_AT(board, start_x, start_y), true);
-    
-    // Marca como revelado imediatamente para evitar re-enfileirar
-    SET_REVEALED(CELLS_AT(board, start_x, start_y), true);
-    revealed_cells++;
+    /* Undo: início de lote */
+    empilhar_undo(t, x_inicio, y_inicio, CELULA_EM(t, x_inicio, y_inicio), false);
 
-    // Se a primeira célula clicada não for vazia (tem número ou mina), processamos apenas ela e paramos.
-    if (MINE_NUM(CELLS_AT(board, start_x, start_y)) != 0 || IS_MINE(CELLS_AT(board, start_x, start_y))) {
-        free(head); // Limpa fila de um elemento
+    DEFINIR_REVELADA(CELULA_EM(t, x_inicio, y_inicio), true);
+    celulas_reveladas++;
+
+    /* Se clicou em número ou mina, não expande */
+    if (NUM_MINAS(CELULA_EM(t, x_inicio, y_inicio)) != 0 ||
+        EH_MINA(CELULA_EM(t, x_inicio, y_inicio))) {
+        free(inicio);
         return;
     }
 
-    // Processamento da Fila (BFS)
-    bool first_node = true; // Controla o push no stack para os vizinhos
-    while (head != NULL) {
-        // Dequeue
-        QueueNode *curr = head;
-        head = head->next;
-        if (head == NULL) tail = NULL;
+    /* BFS */
+    while (inicio) {
+        NoFila *atual = inicio;
+        inicio = inicio->proximo;
+        if (!inicio) fim = NULL;
 
-        size_t cx = curr->x;
-        size_t cy = curr->y;
-        free(curr);
+        size_t cx = atual->x;
+        size_t cy = atual->y;
+        free(atual);
 
-        // Verifica vizinhos
         for (size_t j = 0; j < 8; j++) {
-            size_t nx = cx + dirs[j][0];
-            size_t ny = cy + dirs[j][1];
+            size_t nx = cx + direcoes[j][0];
+            size_t ny = cy + direcoes[j][1];
 
-            if (nx >= board->width || ny >= board->height) continue;
-            
-            Cell *n_cell = &CELLS_AT(board, nx, ny);
-            if (IS_REVEALED(*n_cell) || IS_FLAGGED(*n_cell)) continue;
+            if (nx >= t->largura || ny >= t->altura) continue;
 
-            // Salva no stack de Undo (como parte do mesmo lote, então is_batch_start = false)
-            stack_push(board, nx, ny, *n_cell, false);
+            Celula *prox = &CELULA_EM(t, nx, ny);
 
-            SET_REVEALED(*n_cell, true);
-            revealed_cells++;
+            if (ESTA_REVELADA(*prox) || TEM_BANDEIRA(*prox)) continue;
 
-            // Se o vizinho for vazio (0), adiciona à fila para expandir
-            if (MINE_NUM(*n_cell) == 0 && !IS_MINE(*n_cell)) {
-                ENQUEUE(nx, ny);
+            /* Undo: continuação do lote */
+            empilhar_undo(t, nx, ny, *prox, false);
+
+            DEFINIR_REVELADA(*prox, true);
+            celulas_reveladas++;
+
+            /* Só expande células vazias */
+            if (NUM_MINAS(*prox) == 0 && !EH_MINA(*prox)) {
+                ENFILEIRAR(nx, ny);
             }
         }
-        first_node = false;
     }
-    #undef ENQUEUE
+
+    #undef ENFILEIRAR
 }
 
-/**
- * @brief Revela células ao redor de uma célula numerada se o número de bandeiras corresponder (Chord).
- * @param board Ponteiro para o tabuleiro.
- * @param x Coordenada X.
- * @param y Coordenada Y.
- * @return true se uma mina explodiu, false caso contrário.
- */
-bool reveal_around(Board *board, size_t x, size_t y) {
-    size_t mine_num = MINE_NUM(CELLS_AT(board, x, y));
-    
-    // Conta flags ao redor
+//Tenta revelar ao redor se a quantidade de bandeiras bater com o número da célula
+bool revelar_ao_redor(Tabuleiro *t, size_t x, size_t y) {
+    size_t num_minas = NUM_MINAS(CELULA_EM(t, x, y));
+
+    /* Conta quantas bandeiras existem ao redor */
     for (size_t i = 0; i < 8; i++) {
-        size_t nx = x + dirs[i][0];
-        size_t ny = y + dirs[i][1];
-        if (nx >= board->width || ny >= board->height) continue;
-        if (IS_FLAGGED(CELLS_AT(board, nx, ny))) mine_num -= 1;
+        size_t nx = x + direcoes[i][0];
+        size_t ny = y + direcoes[i][1];
+
+        if (nx >= t->largura || ny >= t->altura)
+            continue;
+
+        if (TEM_BANDEIRA(CELULA_EM(t, nx, ny)))
+            num_minas -= 1;
     }
 
-    bool hit_mine = false;
-    // Se flags suficientes, revela o resto
-    if (mine_num <= 0) {
-        bool first_reveal = true; // Para controlar o "Undo Batch"
-        
+    bool acertou_mina = false;
+
+    /* Se bandeiras suficientes, revela vizinhos */
+    if (num_minas <= 0) {
         for (size_t i = 0; i < 8; i++) {
-            size_t nx = x + dirs[i][0];
-            size_t ny = y + dirs[i][1];
-            if (nx >= board->width || ny >= board->height) continue;
+            size_t nx = x + direcoes[i][0];
+            size_t ny = y + direcoes[i][1];
+
+            if (nx >= t->largura || ny >= t->altura)
+                continue;
             
-            Cell cell = CELLS_AT(board, nx, ny);
-            if (!IS_FLAGGED(cell) && !IS_REVEALED(cell)) {
-                // Truque: chamamos reveal_cell, mas precisamos garantir que o stack saiba que é um grupo
-                // A reveal_cell já cria um batch start=true. 
-                // Se quisermos agrupar o "Chord" num único Undo, teríamos que passar um flag para reveal_cell.
-                // Para simplificar, cada célula aberta pelo Chord será um "passo" de undo individual.
-                reveal_cell(board, nx, ny);
-                
-                if (!hit_mine && IS_MINE(CELLS_AT(board, nx, ny))) {
-                    hit_mine = true;
-                }
+            Celula cel = CELULA_EM(t, nx, ny);
+
+            if (!TEM_BANDEIRA(cel) && !ESTA_REVELADA(cel)) {
+                /* Cada revelação abre seu próprio lote de undo */
+                revelar_celula(t, nx, ny);
+
+                if (!acertou_mina && EH_MINA(CELULA_EM(t, nx, ny)))
+                    acertou_mina = true;
             }
         }
     }
-    return hit_mine;
+
+    return acertou_mina;
 }
 
-/**
- * @brief Revela todo o tabuleiro (Game Over).
- * @param board Ponteiro para o tabuleiro.
- */
-void reveal_board(Board *board) {
-    // Não usamos stack aqui pois o jogo acabou
-    for (size_t y = 0; y < board->height; y++) {
-        for (size_t x = 0; x < board->width; x++) {
-             SET_REVEALED(CELLS_AT(board, x, y), true);
+//Revela todo o tabuleiro (Fim de jogo).
+void revelar_tabuleiro(Tabuleiro *tab) {
+    for (size_t y = 0; y < tab->altura; y++) {
+        for (size_t x = 0; x < tab->largura; x++) {
+             DEFINIR_REVELADA(CELULA_EM(tab, x, y), true);
         }
     }
 }
 
-/**
- * @brief Limpa a tela e redesenha o tabuleiro.
- * @param board Ponteiro para o tabuleiro.
- */
-void refresh_screen(Board *board) {
-    printf("\x1b[H\x1b[2J"); // ANSI escape codes para limpar tela
-    print_board(board);
-    
-    // Mostra status da Pilha e Lista para debug/info
-    size_t stack_depth = 0;
-    StackNode *s = board->undo_stack;
-    while(s) { stack_depth++; s = s->next; }
-    
-    size_t flag_count = 0;
-    DListNode *f = board->flags_head;
-    while(f) { flag_count++; f = f->next; }
-    
-    printf("Undo Stack Depth: %zu | Active Flags (List): %zu\n", stack_depth, flag_count);
+//Verifica condição de vitória.
+bool verificar_vitoria(Tabuleiro *tab) {
+    size_t total_seguras = (tab->largura * tab->altura) - tab->qtd_minas;
+    return celulas_reveladas == total_seguras;
 }
 
-/**
- * @brief Imprime as coordenadas de todas as bandeiras usando a Lista Dupla.
- * @param board Ponteiro para o tabuleiro.
- */
-void list_flags(Board *board) {
-    printf("Flagged Cells: ");
-    DListNode *curr = board->flags_head;
-    if (!curr) printf("(None)");
-    while (curr) {
-        printf("[%zu, %zu] ", curr->x, curr->y);
-        curr = curr->next;
+//Lista todas as bandeiras usando a lista duplamente encadeada.
+void listar_bandeiras(Tabuleiro *tab) {
+    printf("Células com Bandeira: ");
+    NoListaDupla *atual = tab->inicio_bandeiras;
+    if (!atual) printf("(Nenhuma)");
+
+    while (atual) {
+        printf("[%zu, %zu] ", atual->x, atual->y);
+        atual = atual->proximo;
     }
-    printf("\nPress Enter...");
+
+    printf("\nPressione Enter...");
     char tmp[10];
-    fgets(tmp, 10, stdin);
+    ler_entrada(tmp, 10);
 }
 
-/**
- * @brief Menu principal de seleção de dificuldade.
- */
-void print_menu(void) {
-    printf("\x1b[H\x1b[2J");
-    printf("MineCweeper (Data Structures Edition)\n"
-           "Difficulty options\n"
-           "(E)asy   - 9x9 grid, 10 mines\n"
-           "(M)edium - 16x16 grid, 40 mines\n"
-           "(H)ard   - 30x16 grid, 99 mines\n"
-           "Choose difficulty:\n\n"
-           "(Type 'quit' to quit)\n\x1b[2A");
+//Libera toda a memória usada pelo jogo.
+void liberar_memoria_jogo(Tabuleiro *tab) {
+    while(pilha_desfazer(tab)); 
+
+    while(tab->inicio_bandeiras)
+        lista_dupla_remover(tab, tab->inicio_bandeiras->x, tab->inicio_bandeiras->y);
+
+    if (tab->celulas) {
+        free(tab->celulas);
+        tab->celulas = NULL;
+    }
 }
 
-/**
- * @brief Menu de ajuda com comandos.
- */
-void print_help_menu(void) {
-    printf("Commands:\n"
-           "r y x  : reveal cell (y=row, x=col)\n"
-           "f y x  : flag/unflag cell\n"
-           "u      : undo last move (uses Stack)\n"
-           "lf     : list all flags (uses Doubly Linked List)\n"
-           "help   : prints this list\n"
-           "quit   : quits the game\n"
-           "Press Enter...");
+//Imprimir menu
+void imprimir_menu(void) {
+    printf("\x1b[H\x1b[2J"); // Limpar tela
+    printf("Campo Minado (Edição Pilha/Fila/Lista)\n"
+           "(F)ácil   - 9x9, 10 minas\n"
+           "(M)édio   - 16x16, 40 minas\n"
+           "(D)ifícil - 30x16, 99 minas\n"
+           "Escolha a dificuldade (digite 'ajuda' ou 'sair'):\n");
+}
+
+//Imprimir ajuda
+void imprimir_menu_ajuda(void) {
+    printf("\nComandos:\n"
+           "r y x  : revelar célula (y=linha, x=coluna)\n"
+           "b y x  : marcar/desmarcar bandeira\n"
+           "d      : desfazer última jogada\n"
+           "lb     : listar bandeiras\n"
+           "ajuda  : mostrar ajuda\n"
+           "sair   : encerrar jogo\n"
+           "Pressione Enter...");
     char tmp[10];
-    fgets(tmp, 10, stdin);
+    ler_entrada(tmp, 10);
 }
 
-/**
- * @brief Função principal.
- */
+/* --- MAIN --- */
+
 int main(void) {
     srand(time(NULL));
+    Tabuleiro tabuleiro = {0};
+    char buf[TAM_BUFFER_ENTRADA] = {0};
 
-    Board board = {0};
-    char buf[IN_BUF_SIZE] = {0};
+_inicio_do_jogo:
 
-_begin_game:
+    /* --- SELEÇÃO DE DIFICULDADE --- */
     for (;;) {
-        print_menu();
-        read_command(buf);
-        if (strcmp(buf, "quit") == 0) goto _exit_game;
+        imprimir_menu();
+        printf("> ");
+        ler_entrada(buf, TAM_BUFFER_ENTRADA);
 
-        if (strcmp(buf, "E") == 0) {
-            board.width = board.height = 9;
-            board.mine_num = 10;
-        } else if (strcmp(buf, "M") == 0) {
-            board.width = board.height = 16;
-            board.mine_num = 40;
-        } else if (strcmp(buf, "H") == 0) {
-            board.width = 30;
-            board.height = 16;
-            board.mine_num = 99;
-        } else {
+        if (strcmp(buf, "sair") == 0) goto _sair_do_jogo;
+
+        if (strcmp(buf, "ajuda") == 0) {
+            imprimir_menu_ajuda();
+            atualizar_tela(&tabuleiro);
             continue;
         }
+
+        if (strcmp(buf, "F") == 0) { 
+            tabuleiro.largura = 9;  
+            tabuleiro.altura = 9;  
+            tabuleiro.qtd_minas = 10; 
+        }
+        else if (strcmp(buf, "M") == 0) { 
+            tabuleiro.largura = 16; 
+            tabuleiro.altura = 16; 
+            tabuleiro.qtd_minas = 40; 
+        }
+        else if (strcmp(buf, "D") == 0) { 
+            tabuleiro.largura = 30; 
+            tabuleiro.altura = 16; 
+            tabuleiro.qtd_minas = 99; 
+        }
+        else continue;
+
         break;
     }
 
-    init_game(&board);
-    refresh_screen(&board);
+    iniciar_jogo(&tabuleiro);
+    atualizar_tela(&tabuleiro);
 
+    /* --- LOOP PRINCIPAL --- */
     for (;;) {
-        read_command(buf);
+        printf("\nComando > ");
+        ler_entrada(buf, TAM_BUFFER_ENTRADA);
 
-        if (strcmp(buf, "quit") == 0) goto _exit_game;
-        if (strcmp(buf, "help") == 0) {
-            print_help_menu();
-            refresh_screen(&board);
-            continue;
-        }
-        if (strcmp(buf, "u") == 0) {
-            if (stack_undo(&board)) {
-                printf("Undo performed.\n");
-            } else {
-                printf("Nothing to undo.\n");
-            }
-            refresh_screen(&board);
-            continue;
-        }
-        if (strcmp(buf, "lf") == 0) {
-            list_flags(&board);
-            refresh_screen(&board);
+        if (strcmp(buf, "sair") == 0) goto _sair_do_jogo;
+        
+        if (strcmp(buf, "ajuda") == 0) {
+            imprimir_menu_ajuda();
+            atualizar_tela(&tabuleiro);
             continue;
         }
 
-        char action;
+        if (strcmp(buf, "d") == 0) {
+            if (pilha_desfazer(&tabuleiro))
+                printf("Desfeito.\n");
+            else
+                printf("Nada para desfazer.\n");
+
+            atualizar_tela(&tabuleiro);
+            continue;
+        }
+        if (strcmp(buf, "lb") == 0) {
+            listar_bandeiras(&tabuleiro);
+            atualizar_tela(&tabuleiro);
+            continue;
+        }
+
+        char acao;
         size_t x, y;
-        // Parse: char + int + int
-        if (sscanf(buf, "%c %zu %zu", &action, &y, &x) == 3) {
-            if (x >= board.width || y >= board.height) {
-                printf("Invalid coordinates (%zu,%zu).\n", x, y);
+        if (sscanf(buf, "%c %zu %zu", &acao, &y, &x) == 3) {
+            if (x >= tabuleiro.largura || y >= tabuleiro.altura) {
+                printf("Coordenadas inválidas.\n");
                 continue;
             }
 
-            if (action == 'f') {
-                // Salva estado para Undo
-                stack_push(&board, x, y, CELLS_AT(&board, x, y), true);
-                
-                bool is_flagged = IS_FLAGGED(CELLS_AT(&board, x, y));
-                SET_FLAGGED(CELLS_AT(&board, x, y), !is_flagged);
-                
-                // Atualiza Lista Dupla
-                if (!is_flagged) dlist_add(&board, x, y);
-                else dlist_remove(&board, x, y);
+            if (acao == 'b') {
+                alternar_bandeira(&tabuleiro, x, y);   // função abaixo
+                atualizar_tela(&tabuleiro);
+            }
+            else if (acao == 'r') {
+                Celula atual = CELULA_EM(&tabuleiro, x, y);
 
-            } else if (action == 'r') {
-                if (IS_FLAGGED(CELLS_AT(&board, x, y))) {
-                    printf("Cell is flagged. Unflag first.\n");
+                /* usar os defines que você tem */
+                if (TEM_BANDEIRA(atual)) {
+                    printf("A célula está marcada com bandeira. Remova primeiro.\n");
                     continue;
                 }
 
-                if (IS_REVEALED(CELLS_AT(&board, x, y))) {
-                    // Tenta revelar ao redor (Chord)
-                    bool hit_mine = reveal_around(&board, x, y);
-                    if (hit_mine) {
-                        reveal_board(&board);
-                        refresh_screen(&board);
-                        printf("\x1b[31mYou hit a mine! You lose!\x1b[0m\n");
-                        break;
-                    }
+                bool acertou_mina = false;
+
+                if (ESTA_REVELADA(atual)) {
+                    acertou_mina = revelar_ao_redor(&tabuleiro, x, y);
                 } else {
-                    // Revela célula (Usa Fila internamente)
-                    reveal_cell(&board, x, y);
-                    
-                    if (IS_MINE(CELLS_AT(&board, x, y))) {
-                        reveal_board(&board);
-                        refresh_screen(&board);
-                        printf("\x1b[31mYou hit a mine! You lose!\x1b[0m\n");
-                        break;
-                    }
+                    revelar_celula(&tabuleiro, x, y);
+                    if (EH_MINA(CELULA_EM(&tabuleiro, x, y))) acertou_mina = true;
                 }
-                
-                // Checa vitória
-                if (revealed_cells == board.width*board.height - board.mine_num) {
-                    refresh_screen(&board);
-                    printf("\x1b[32mYou won! Congratulations!\x1b[0m\n");
+
+                if (acertou_mina) {
+                    revelar_tabuleiro(&tabuleiro);
+                    atualizar_tela(&tabuleiro);
+                    printf("\n\x1b[31mBOOM! Você acertou uma mina!\x1b[0m\n");
                     break;
                 }
+
+                if (verificar_vitoria(&tabuleiro)) {
+                    atualizar_tela(&tabuleiro);
+                    printf("\n\x1b[32mPARABÉNS! Você limpou o campo!\x1b[0m\n");
+                    break;
+                }
+
+                atualizar_tela(&tabuleiro);
             }
-            refresh_screen(&board);
         } else {
-            printf("Invalid command: '%s'. Use 'help' for info.\n", buf);
+            printf("Comando inválido.\n");
         }
     }
 
+
+    /* --- REINICIAR JOGO --- */
     for (;;) {
-        printf("Try again? (Y/N) > ");
-        read_command(buf);
-        if (strcmp(buf, "Y") == 0 || strcmp(buf, "y") == 0) {
-            // Limpa estruturas antes de reiniciar
-            while(stack_undo(&board)); // Esvazia stack
-            while(board.flags_head) dlist_remove(&board, board.flags_head->x, board.flags_head->y); // Esvazia lista
-            goto _begin_game;
-        } else if (strcmp(buf, "N") == 0 || strcmp(buf, "n") == 0) {
+        printf("Jogar novamente? (S/N) > ");
+        ler_entrada(buf, TAM_BUFFER_ENTRADA);
+
+        if (strcmp(buf, "S") == 0 || strcmp(buf, "s") == 0) {
+            liberar_memoria_jogo(&tabuleiro);
+            goto _inicio_do_jogo;
+        } 
+        else if (strcmp(buf, "N") == 0 || strcmp(buf, "n") == 0) {
             break;
         }
     }
 
-_exit_game:
-    // Limpeza de memória final
-    while(stack_undo(&board));
-    while(board.flags_head) dlist_remove(&board, board.flags_head->x, board.flags_head->y);
-    free(board.cells);
+_sair_do_jogo:
+    liberar_memoria_jogo(&tabuleiro);
+    printf("Até mais!\n");
     return 0;
 }
