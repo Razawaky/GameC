@@ -1,9 +1,5 @@
-/*
-    Campo Minado- Estruturas de Dados
-    Integração: Pilha (Undo), Fila (Flood Fill), Lista Dupla (Flags)
-*/
+/*CAMPO MINADO  VINÍCIUS DUARTE E VINÍCIUS SANTANA*/
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -190,9 +186,6 @@ void alternar_bandeira(Tabuleiro *t, size_t x, size_t y) {
     // Não pode alternar bandeira se a célula já está revelada
     if (ESTA_REVELADA(*cel)) return;
 
-    // Empilha estado antigo para undo
-    empilhar_undo(t, x, y, *cel, true);
-
     if (TEM_BANDEIRA(*cel)) {
         // Remove bandeira da lista
         lista_dupla_remover(t, x, y);
@@ -331,12 +324,13 @@ void atualizar_tela(Tabuleiro *t) {
     imprimir_tabuleiro(t);
 
     // Estatísticas das estruturas de dados
-    size_t profundidade_pilha = 0;
+    size_t jogadas_feitas = 0;
     NoPilha *p = t->pilha_desfazer;
-    while (p) { 
-        profundidade_pilha++; 
-        p = p->proximo; 
+    while (p) {
+        if (p->inicio_lote) jogadas_feitas++;
+        p = p->proximo;
     }
+
     
     size_t total_bandeiras = 0;
     NoListaDupla *b = t->inicio_bandeiras;
@@ -347,7 +341,7 @@ void atualizar_tela(Tabuleiro *t) {
     
     printf("--- Informações ---\n");
     printf("Jogadas Feitas: %zu | Bandeiras Ativas: %zu\n",
-           profundidade_pilha,
+           jogadas_feitas,
            total_bandeiras
     );
 }
@@ -510,7 +504,7 @@ void liberar_memoria_jogo(Tabuleiro *tab) {
 //Imprimir menu
 void imprimir_menu(void) {
     printf("\x1b[H\x1b[2J"); // Limpar tela
-    printf("Campo Minado (Edição Pilha/Fila/Lista)\n"
+    printf("**** Campo Minado ****\n"
            "(F)ácil   - 9x9, 10 minas\n"
            "(M)édio   - 16x16, 40 minas\n"
            "(D)ifícil - 30x16, 99 minas\n"
